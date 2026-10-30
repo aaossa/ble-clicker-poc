@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="theme-color" content="#111111">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<title>Clicker</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column; gap: 10px; padding: 10px;
+    background: #111; color: #eee; font: 16px system-ui, sans-serif;
+    touch-action: manipulation; user-select: none;
+  }
+  button, input {
+    border: 0; border-radius: 14px; background: #2a2a2a; color: inherit;
+    font: inherit; font-size: 1.1rem; padding: 14px 8px;
+  }
+  button:active:not(:disabled) { background: #444; }
+  button:disabled { opacity: .4; }
+  #status { text-align: center; font-size: .9rem; color: #999; }
+  #status.ok { color: #6c6; }
+  #status.err { color: #e66; }
+  #setup { display: grid; grid-template-columns: 2fr 1fr; gap: 8px; }
+  #token { text-align: center; letter-spacing: .1em; }
+  #connect { background: #0d47a1; }
+  #main { flex: 1; display: grid; grid-template-columns: 1fr 2fr; gap: 10px; min-height: 0; }
+  #main button { font-size: 1.6rem; }
+  #next { background: #1b5e20; }
+  .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  #timer { text-align: center; font-variant-numeric: tabular-nums; font-size: 1.4rem; }
+</style>
+</head>
+<body>
+  <div id="status">Not connected</div>
+  <div id="setup">
+    <input id="token" placeholder="pairing token" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button id="connect">Connect</button>
+  </div>
+  <div id="timer">00:00</div>
+  <div id="main">
+    <button class="cmd" data-cmd="prev" disabled>◀ Back</button>
+    <button class="cmd" id="next" data-cmd="next" disabled>Next ▶</button>
+  </div>
+  <div class="row">
+    <button class="cmd" data-cmd="first" disabled>⏮ First</button>
+    <button class="cmd" data-cmd="last" disabled>Last ⏭</button>
+    <button class="cmd" data-cmd="blank" disabled>Blank</button>
+    <button id="reset">Reset ⏱</button>
+  </div>
+  <div class="row">
+    <button class="cmd" data-cmd="tab_prev" disabled>◀ Tab</button>
+    <button class="cmd" data-cmd="tab1" disabled>Tab 1</button>
+    <button class="cmd" data-cmd="tab2" disabled>Tab 2</button>
+    <button class="cmd" data-cmd="tab_next" disabled>Tab ▶</button>
+  </div>
+<script>
+const SERVICE = "6f0b1c10-5d6b-4b53-9a43-5f1f3f2a0001";
+const CHAR = "6f0b1c10-5d6b-4b53-9a43-5f1f3f2a0002";
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+const tokenEl = $("token");
+const cmdButtons = document.querySelectorAll(".cmd");
+
+let device = null;
+let characteristic = null;
+let queue = Promise.resolve();
+let userDisconnected = false;
+
+function setStatus(text, cls) { statusEl.textContent = text; statusEl.className = cls || ""; }
+function setEnabled(on) { cmdButtons.forEach((b) => { b.disabled = !on; }); }
+
+// A QR link like .../#t=abcd1234 fills in the token; it is then kept on the device.
+const hashToken = new URLSearchParams(location.hash.slice(1)).get("t");
+if (hashToken) {
+  localStorage.setItem("token", hashToken);
+  history.replaceState(null, "", location.pathname);
+}
+tokenEl.value = localStorage.getItem("token") || "";
+tokenEl.addEventListener("input", () => localStorage.setItem("token", tokenEl.value.trim()));
+
+async function openGatt() {
+  setStatus("Connecting…");
+  const server = await device.gatt.connect();
+  const service = await server.getPrimaryService(SERVICE);
+  characteristic = await service.getCharacteristic(CHAR);
+  setEnabled(true);
+  setStatus("Connected", "ok");
+}
+
+async function reconnect() {
+  for (let attempt = 1; attempt <= 5 && !userDisconnected; attempt++) {
+    try {
+      await openGatt();
+      return;
+    } catch {
+      setStatus(`Reconnecting (${attempt}/5)…`, "err");
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
+  }
+  if (!userDisconnected) setStatus("Disconnected. Tap Connect.", "err");
+}
+
+function onDisconnected() {
+  setEnabled(false);
+  characteristic = null;
+  if (!userDisconnected) reconnect();
+}
+
+$("connect").addEventListener("click", async () => {
+  if (!navigator.bluetooth) {
+    setStatus("Web Bluetooth not available. Use Chrome on Android.", "err");
+    return;
+  }
+  if (device && device.gatt.connected) {
+    userDisconnected = true;
+    device.gatt.disconnect();
+    $("connect").textContent = "Connect";
+    setStatus("Not connected");
+    return;
+  }
+  userDisconnected = false;
+  try {
+    if (!device) {
+      device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
+      device.addEventListener("gattserverdisconnected", onDisconnected);
+    }
+    await openGatt();
+    $("connect").textContent = "Disconnect";
+  } catch (e) {
+    setStatus(e.name === "NotFoundError" ? "No device chosen" : "Failed: " + e.message, "err");
+  }
+});
+
+function send(cmd) {
+  const token = tokenEl.value.trim();
+  if (!characteristic || !token) { setStatus("Connect and set the token first", "err"); return; }
+  if (navigator.vibrate) navigator.vibrate(15);
+  const data = new TextEncoder().encode(token + "|" + cmd);
+  // Writes must not overlap, so chain them.
+  queue = queue
+    .then(() => characteristic.writeValueWithoutResponse(data))
+    .then(() => setStatus("Sent: " + cmd, "ok"))
+    .catch((e) => setStatus("Failed: " + e.message, "err"));
+}
+cmdButtons.forEach((b) => b.addEventListener("click", () => send(b.dataset.cmd)));
+
+let start = Date.now();
+$("reset").addEventListener("click", () => { start = Date.now(); });
+setInterval(() => {
+  const s = Math.floor((Date.now() - start) / 1000);
+  $("timer").textContent = String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
+}, 500);
+
+if ("wakeLock" in navigator) {
+  const lock = () => navigator.wakeLock.request("screen").catch(() => {});
+  lock();
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) lock(); });
+}
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js");
+</script>
+</body>
+</html>
